@@ -47,16 +47,11 @@
 #include <linux/utsname.h>
 
 #include <asm/uaccess.h>
-//thomas_chu +++
-#include <linux/asus_global.h>
-//thomas_chu ---
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/printk.h>
 
-#ifdef CONFIG_EARLY_PRINTK_DIRECT
-extern void printascii(char *);
-#endif
+#include <linux/asus_global.h>
 
 /* printk's without a loglevel use this.. */
 #define DEFAULT_MESSAGE_LOGLEVEL CONFIG_DEFAULT_MESSAGE_LOGLEVEL
@@ -215,9 +210,6 @@ struct log {
 	u8 facility;		/* syslog facility */
 	u8 flags:5;		/* internal record flags */
 	u8 level:3;		/* syslog level */
-#if defined(CONFIG_LOG_BUF_MAGIC)
-	u32 magic;		/* handle for ramdump analysis tools */
-#endif
 };
 
 /*
@@ -226,44 +218,6 @@ struct log {
  */
 static DEFINE_RAW_SPINLOCK(logbuf_lock);
 
-static char *asus_log_buf = NULL;
-static bool is_logging_to_asus_buffer = false;
-void *memset_nc(void *s, int c, size_t count);
-
-/* this memcpy_nc() is for non cached memory */
-static void *memcpy_nc(void *dest, const void *src, size_t n)
-{
-	int i = 0;
-	u8 *d = (u8 *)dest, *s = (u8 *)src;
-	for (i = 0; i < n; i++)
-		d[i] = s[i];
-	return dest;
-}
-static int write_to_asus_log_buffer(const char *text, size_t text_len,
-				enum log_flags lflags) {
-	static ulong log_write_index = 0; /* the index to write the log in asus log buffer */
-	if (!asus_log_buf) {
-		return -1;
-	}
-	if (log_write_index >= PRINTK_BUFFER_SLOT_SIZE) {
-		return -2;
-	}
-	if (log_write_index + text_len >= PRINTK_BUFFER_SLOT_SIZE) {
-		ulong part1 = PRINTK_BUFFER_SLOT_SIZE - log_write_index;
-		ulong part2 = text_len -part1;
-		memcpy_nc(asus_log_buf+log_write_index, text, part1);
-		memcpy_nc(asus_log_buf, text + part1, part2);
-		log_write_index = part2;
-	} else {
-		memcpy_nc(asus_log_buf+log_write_index, text, text_len);
-		log_write_index += text_len;
-	}
-	if (lflags & LOG_NEWLINE) {
-		asus_log_buf[log_write_index++] = '\n';
-		log_write_index = log_write_index % PRINTK_BUFFER_SLOT_SIZE;
-	}
-	return text_len;
-}
 #ifdef CONFIG_PRINTK
 DECLARE_WAIT_QUEUE_HEAD(log_wait);
 /* the next printk record to read by syslog(READ) or /proc/kmsg */
@@ -303,29 +257,15 @@ static char __log_buf[__LOG_BUF_LEN] __aligned(LOG_ALIGN);
 static char *log_buf = __log_buf;
 static u32 log_buf_len = __LOG_BUF_LEN;
 
-#if defined(CONFIG_OOPS_LOG_BUFFER)
-#define __OOPS_LOG_BUF_LEN (1 << CONFIG_OOPS_LOG_BUF_SHIFT)
-static char __log_oops_buf[__OOPS_LOG_BUF_LEN] __aligned(LOG_ALIGN);
-static char *log_oops_buf = __log_oops_buf;
-static u32 log_oops_buf_len = __OOPS_LOG_BUF_LEN;
-
-static int log_oops_full;
-/* if this sequence of log entry starts to wrap arounds, move to oops buffer */
-static u64 log_oops_first_seq = ULLONG_MAX;
-static u64 log_oops_last_seq;
-static u32 log_oops_next_idx;
-
-static u32 syslog_oops_buf_idx;
-
-static const char log_oops_end[] = "---end of oops log buffer---";
-#endif
-
-#if defined(CONFIG_LOG_BUF_MAGIC)
-static u32 __log_align __used = LOG_ALIGN;
-#define LOG_MAGIC(msg) ((msg)->magic = 0x5d7aefca)
-#else
-#define LOG_MAGIC(msg)
-#endif
+struct _asus_global asus_global =
+{
+        .asus_global_magic = ASUS_GLOBAL_MAGIC,
+        .ramdump_enable_magic = ASUS_GLOBAL_RUMDUMP_MAGIC,
+        .kernel_log_addr = __log_buf,
+        .kernel_log_size = __LOG_BUF_LEN,
+//      .kernel_version = ASUS_SW_VER,
+};
+int boot_after_60sec = 0;
 
 /* cpu currently holding logbuf_lock */
 static volatile unsigned int logbuf_cpu = UINT_MAX;
@@ -343,41 +283,23 @@ static char *log_dict(const struct log *msg)
 }
 
 /* get record by index; idx must point to valid msg */
-static struct log *log_from_idx(u32 idx, bool logbuf)
+static struct log *log_from_idx(u32 idx)
 {
-	struct log *msg;
-	char *buf;
-
-#if defined(CONFIG_OOPS_LOG_BUFFER)
-	buf = logbuf ? log_buf : log_oops_buf;
-#else
-	buf = log_buf;
-	BUG_ON(!logbuf);
-#endif
-	msg = (struct log *)(buf + idx);
+	struct log *msg = (struct log *)(log_buf + idx);
 
 	/*
 	 * A length == 0 record is the end of buffer marker. Wrap around and
 	 * read the message at the start of the buffer.
 	 */
 	if (!msg->len)
-		return (struct log *)buf;
+		return (struct log *)log_buf;
 	return msg;
 }
 
 /* get next record; idx must point to valid msg */
-static u32 log_next(u32 idx, bool logbuf)
+static u32 log_next(u32 idx)
 {
-	struct log *msg;
-	char *buf;
-
-#if defined(CONFIG_OOPS_LOG_BUFFER)
-	buf = logbuf ? log_buf : log_oops_buf;
-#else
-	buf = log_buf;
-	BUG_ON(!logbuf);
-#endif
-	msg = (struct log *)(buf + idx);
+	struct log *msg = (struct log *)(log_buf + idx);
 
 	/* length == 0 indicates the end of the buffer; wrap */
 	/*
@@ -386,64 +308,11 @@ static u32 log_next(u32 idx, bool logbuf)
 	 * return the one after that.
 	 */
 	if (!msg->len) {
-		msg = (struct log *)buf;
+		msg = (struct log *)log_buf;
 		return msg->len;
 	}
 	return idx + msg->len;
 }
-
-#if defined(CONFIG_OOPS_LOG_BUFFER)
-void oops_printk_start(void)
-{
-	raw_spin_lock_irq(&logbuf_lock);
-	if (log_oops_first_seq == ULLONG_MAX)
-		log_oops_first_seq = log_next_seq;
-	raw_spin_unlock_irq(&logbuf_lock);
-}
-
-static void log_oops_store(struct log *msg)
-{
-	u32 free;
-	const int eom_len = strlen(log_oops_end);
-	const size_t eom_size = sizeof(struct log) + eom_len;
-	char buf[eom_size + LOG_ALIGN];
-	u32 pad_len;
-	u64 ts_nsec;
-	int eom = 0;
-
-	if (log_first_seq >= log_oops_first_seq && !log_oops_full) {
-		free = log_oops_buf_len - log_oops_next_idx;
-		pad_len = (-eom_size) & (LOG_ALIGN - 1);
-		if ((free - msg->len) < (eom_size + pad_len)) {
-			ts_nsec = msg->ts_nsec;
-			msg = (struct log *)buf;
-			memcpy(log_text(msg), log_oops_end, eom_len);
-			msg->len = eom_size + pad_len;
-			msg->text_len = eom_len;
-			msg->dict_len = 0;
-			msg->facility = 1;
-			msg->level = default_message_loglevel & 7;
-			msg->flags = (LOG_NEWLINE | LOG_PREFIX) & 0x1f;
-			msg->ts_nsec = ts_nsec;
-			eom = 1;
-		}
-
-		if (free >= msg->len) {
-			memcpy(log_oops_buf + log_oops_next_idx, msg, msg->len);
-			log_oops_next_idx += msg->len;
-			log_oops_last_seq = log_first_seq;
-			if (eom)
-				log_oops_full = 1;
-		} else {
-			log_oops_full = 1;
-		}
-	}
-}
-#else
-static void log_oops_store(struct log *msg)
-{
-}
-#endif
 
 /* insert record into the buffer, discard old ones, update heads */
 static void log_store(int facility, int level,
@@ -470,11 +339,8 @@ static void log_store(int facility, int level,
 		if (free > size + sizeof(struct log))
 			break;
 
-		msg = (struct log *)(log_buf + log_first_idx);
-		log_oops_store(msg);
-
 		/* drop old messages until we have enough contiuous space */
-		log_first_idx = log_next(log_first_idx, true);
+		log_first_idx = log_next(log_first_idx);
 		log_first_seq++;
 	}
 
@@ -485,7 +351,6 @@ static void log_store(int facility, int level,
 		 * to signify a wrap around.
 		 */
 		memset(log_buf + log_next_idx, 0, sizeof(struct log));
-		LOG_MAGIC((struct log *)(log_buf + log_next_idx));
 		log_next_idx = 0;
 	}
 
@@ -498,7 +363,6 @@ static void log_store(int facility, int level,
 	msg->facility = facility;
 	msg->level = level & 7;
 	msg->flags = flags & 0x1f;
-	LOG_MAGIC(msg);
 	if (ts_nsec > 0)
 		msg->ts_nsec = ts_nsec;
 	else
@@ -623,23 +487,6 @@ out:
 	return ret;
 }
 
-#if defined(CONFIG_OOPS_LOG_BUFFER)
-static bool devkmsg_seq_passed(struct devkmsg_user *user)
-{
-	if ((log_oops_first_seq == ULLONG_MAX && user->seq < log_first_seq) ||
-	    (log_oops_first_seq != ULLONG_MAX &&
-	     user->seq < log_oops_first_seq))
-		return true;
-	else
-		return false;
-}
-#else
-static bool devkmsg_seq_passed(struct devkmsg_user *user)
-{
-	return user->seq < log_first_seq;
-}
-#endif
-
 static ssize_t devkmsg_read(struct file *file, char __user *buf,
 			    size_t count, loff_t *ppos)
 {
@@ -650,7 +497,6 @@ static ssize_t devkmsg_read(struct file *file, char __user *buf,
 	char cont = '-';
 	size_t len;
 	ssize_t ret;
-	bool regular_buf = true;
 
 	if (!user)
 		return -EBADF;
@@ -674,7 +520,7 @@ static ssize_t devkmsg_read(struct file *file, char __user *buf,
 		raw_spin_lock_irq(&logbuf_lock);
 	}
 
-	if (devkmsg_seq_passed(user)) {
+	if (user->seq < log_first_seq) {
 		/* our last seen message is gone, return error and reset */
 		user->idx = log_first_idx;
 		user->seq = log_first_seq;
@@ -682,22 +528,8 @@ static ssize_t devkmsg_read(struct file *file, char __user *buf,
 		raw_spin_unlock_irq(&logbuf_lock);
 		goto out;
 	}
-#if defined(CONFIG_OOPS_LOG_BUFFER)
-	else if (log_oops_first_seq != ULLONG_MAX) {
-		if (user->seq <= log_oops_first_seq) {
-			user->idx = 0;
-			regular_buf = false;
-		} else if (user->seq > log_oops_first_seq &&
-			 user->seq < log_oops_last_seq) {
-			regular_buf = false;
-		} else if (user->seq < log_first_seq) {
-			user->idx = log_first_idx;
-			user->seq = log_first_seq;
-		}
-	}
-#endif
 
-	msg = log_from_idx(user->idx, regular_buf);
+	msg = log_from_idx(user->idx);
 	ts_usec = msg->ts_nsec;
 	do_div(ts_usec, 1000);
 
@@ -758,7 +590,7 @@ static ssize_t devkmsg_read(struct file *file, char __user *buf,
 		user->buf[len++] = '\n';
 	}
 
-	user->idx = log_next(user->idx, regular_buf);
+	user->idx = log_next(user->idx);
 	user->seq++;
 	raw_spin_unlock_irq(&logbuf_lock);
 
@@ -777,20 +609,6 @@ out:
 	return ret;
 }
 
-static void devkmsg_set_first(struct devkmsg_user *user)
-{
-#if defined(CONFIG_OOPS_LOG_BUFFER)
-	if (log_oops_first_seq != ULLONG_MAX) {
-		user->idx = 0;
-		user->seq = log_oops_first_seq;
-	} else
-#endif
-	{
-		user->idx = log_first_idx;
-		user->seq = log_first_seq;
-	}
-}
-
 static loff_t devkmsg_llseek(struct file *file, loff_t offset, int whence)
 {
 	struct devkmsg_user *user = file->private_data;
@@ -805,7 +623,8 @@ static loff_t devkmsg_llseek(struct file *file, loff_t offset, int whence)
 	switch (whence) {
 	case SEEK_SET:
 		/* the first record */
-		devkmsg_set_first(user);
+		user->idx = log_first_idx;
+		user->seq = log_first_seq;
 		break;
 	case SEEK_DATA:
 		/*
@@ -872,7 +691,8 @@ static int devkmsg_open(struct inode *inode, struct file *file)
 	mutex_init(&user->lock);
 
 	raw_spin_lock_irq(&logbuf_lock);
-	devkmsg_set_first(user);
+	user->idx = log_first_idx;
+	user->seq = log_first_seq;
 	raw_spin_unlock_irq(&logbuf_lock);
 
 	file->private_data = user;
@@ -929,17 +749,6 @@ void log_buf_kexec_setup(void)
 
 /* requested log_buf_len from kernel cmdline */
 static unsigned long __initdata new_log_buf_len;
-
-//thomas_chu +++
-struct _asus_global asus_global =
-{
-	.asus_global_magic = ASUS_GLOBAL_MAGIC,
-	.ramdump_enable_magic = ASUS_GLOBAL_RUMDUMP_MAGIC,
-	.kernel_log_addr = __log_buf,
-	.kernel_log_size = __LOG_BUF_LEN,
-//	.kernel_version = ASUS_SW_VER,
-};
-//thomas_chu ---
 
 /* save requested log_buf_len since it's too early to process it */
 static int __init log_buf_len_setup(char *str)
@@ -1071,7 +880,6 @@ static bool printk_time;
 #endif
 module_param_named(time, printk_time, bool, S_IRUGO | S_IWUSR);
 
-int boot_after_60sec = 0;
 static size_t print_time(u64 ts, char *buf)
 {
 	unsigned long rem_nsec;
@@ -1084,8 +892,6 @@ static size_t print_time(u64 ts, char *buf)
 	if (!buf)
 		return snprintf(NULL, 0, "[%5lu.000000] ", (unsigned long)ts);
 
-	if (boot_after_60sec == 0 && ts >= 60)
-		boot_after_60sec = 1;
 	return sprintf(buf, "[%5lu.%06lu] ",
 		       (unsigned long)ts, rem_nsec / 1000);
 }
@@ -1172,132 +978,15 @@ static size_t msg_print_text(const struct log *msg, enum log_flags prev,
 	return len;
 }
 
-#if defined(CONFIG_OOPS_LOG_BUFFER)
-static int syslog_oops_buf_print(char __user *buf, int size, char *text)
-{
-	struct log *msg;
-	size_t n;
-	size_t skip;
-	int len = 0;
-
-	raw_spin_lock_irq(&logbuf_lock);
-	if (log_oops_first_seq != ULLONG_MAX &&
-	    syslog_seq < log_oops_first_seq) {
-		syslog_seq = log_oops_first_seq;
-		syslog_oops_buf_idx = 0;
-	}
-	while (size > 0 && log_oops_last_seq > syslog_seq) {
-		skip = syslog_partial;
-		msg = log_from_idx(syslog_oops_buf_idx, false);
-		n = msg_print_text(msg, syslog_prev, true, text,
-				   LOG_LINE_MAX + PREFIX_MAX);
-		if (n - syslog_partial <= size) {
-			/* message fits into buffer, move forward */
-			syslog_oops_buf_idx = log_next(syslog_oops_buf_idx,
-						       false);
-			syslog_seq++;
-			syslog_prev = msg->flags;
-			n -= syslog_partial;
-			syslog_partial = 0;
-		} else if (!len) {
-			/* partial read(), remember position */
-			n = size;
-			syslog_partial += n;
-		} else {
-			n = 0;
-		}
-		if (!n)
-			break;
-
-		raw_spin_unlock_irq(&logbuf_lock);
-		if (copy_to_user(buf, text + skip, n)) {
-			raw_spin_lock_irq(&logbuf_lock);
-			if (!len)
-				len = -EFAULT;
-			break;
-		}
-		raw_spin_lock_irq(&logbuf_lock);
-
-		len += n;
-		size -= n;
-		buf += n;
-	}
-	raw_spin_unlock_irq(&logbuf_lock);
-
-	return len;
-}
-
-static int syslog_print_oops_buf_all(char __user *buf, int size, bool clear,
-				     char *text)
-{
-	int len = 0;
-	u32 idx = 0;
-	u64 seq = clear_seq;
-	enum log_flags prev = 0;
-	u64 next_seq;
-
-	if (!buf)
-		return len;
-
-	raw_spin_lock_irq(&logbuf_lock);
-
-	seq = log_oops_first_seq;
-	next_seq = log_oops_last_seq;
-	while (len >= 0 && len < size && seq < next_seq) {
-		struct log *msg = log_from_idx(idx, false);
-		int textlen;
-
-		textlen = msg_print_text(msg, prev, true, text,
-					 LOG_LINE_MAX + PREFIX_MAX);
-		if (textlen < 0) {
-			len = textlen;
-			break;
-		}
-		idx = log_next(idx, false);
-		seq++;
-		prev = msg->flags;
-
-		raw_spin_unlock_irq(&logbuf_lock);
-		if (copy_to_user(buf + len, text, textlen))
-			len = -EFAULT;
-		else
-			len += textlen;
-		raw_spin_lock_irq(&logbuf_lock);
-	}
-
-	raw_spin_unlock_irq(&logbuf_lock);
-
-	return len;
-}
-#else
-static int syslog_oops_buf_print(char __user *buf, int size, char *text)
-{
-	return 0;
-}
-
-static int syslog_print_oops_buf_all(char __user *buf, int size, bool clear,
-				     char *text)
-{
-	return 0;
-}
-#endif
-
-int syslog_print(char __user *buf, int size)
+static int syslog_print(char __user *buf, int size)
 {
 	char *text;
 	struct log *msg;
-	int oops_buf_len;
 	int len = 0;
 
 	text = kmalloc(LOG_LINE_MAX + PREFIX_MAX, GFP_KERNEL);
 	if (!text)
 		return -ENOMEM;
-
-	oops_buf_len = syslog_oops_buf_print(buf, size, text);
-	if (oops_buf_len < 0)
-		return oops_buf_len;
-
-	size -= oops_buf_len;
 
 	while (size > 0) {
 		size_t n;
@@ -1317,12 +1006,12 @@ int syslog_print(char __user *buf, int size)
 		}
 
 		skip = syslog_partial;
-		msg = log_from_idx(syslog_idx, true);
+		msg = log_from_idx(syslog_idx);
 		n = msg_print_text(msg, syslog_prev, true, text,
 				   LOG_LINE_MAX + PREFIX_MAX);
 		if (n - syslog_partial <= size) {
 			/* message fits into buffer, move forward */
-			syslog_idx = log_next(syslog_idx, true);
+			syslog_idx = log_next(syslog_idx);
 			syslog_seq++;
 			syslog_prev = msg->flags;
 			n -= syslog_partial;
@@ -1338,7 +1027,7 @@ int syslog_print(char __user *buf, int size)
 		if (!n)
 			break;
 
-		if (copy_to_user(buf + oops_buf_len, text + skip, n)) {
+		if (copy_to_user(buf, text + skip, n)) {
 			if (!len)
 				len = -EFAULT;
 			break;
@@ -1350,69 +1039,57 @@ int syslog_print(char __user *buf, int size)
 	}
 
 	kfree(text);
-	if (len > 0)
-		len += oops_buf_len;
 	return len;
 }
 
 static int syslog_print_all(char __user *buf, int size, bool clear)
 {
 	char *text;
-	int oops_len;
 	int len = 0;
 
 	text = kmalloc(LOG_LINE_MAX + PREFIX_MAX, GFP_KERNEL);
 	if (!text)
 		return -ENOMEM;
 
-	oops_len = syslog_print_oops_buf_all(buf, size, clear, text);
-	if (oops_len < 0)
-		return oops_len;
-
 	raw_spin_lock_irq(&logbuf_lock);
 	if (buf) {
 		u64 next_seq;
 		u64 seq;
 		u32 idx;
-		u64 start_seq;
-		u32 start_idx;
 		enum log_flags prev;
 
 		if (clear_seq < log_first_seq) {
 			/* messages are gone, move to first available one */
-			start_seq = log_first_seq;
-			start_idx = log_first_idx;
-		} else {
-			start_seq = clear_seq;
-			start_idx = clear_idx;
+			clear_seq = log_first_seq;
+			clear_idx = log_first_idx;
 		}
 
 		/*
 		 * Find first record that fits, including all following records,
 		 * into the user-provided buffer for this dump.
 		 */
-		seq = start_seq;
-		idx = start_idx;
+		seq = clear_seq;
+		idx = clear_idx;
 		prev = 0;
 		while (seq < log_next_seq) {
-			struct log *msg = log_from_idx(idx, true);
+			struct log *msg = log_from_idx(idx);
 
 			len += msg_print_text(msg, prev, true, NULL, 0);
 			prev = msg->flags;
-			idx = log_next(idx, true);
+			idx = log_next(idx);
 			seq++;
 		}
 
 		/* move first record forward until length fits into the buffer */
-		seq = start_seq;
-		idx = start_idx;
+		seq = clear_seq;
+		idx = clear_idx;
 		prev = 0;
-		while ((len > size - oops_len) && seq < log_next_seq) {
-			struct log *msg = log_from_idx(idx, true);
+		while (len > size && seq < log_next_seq) {
+			struct log *msg = log_from_idx(idx);
 
 			len -= msg_print_text(msg, prev, true, NULL, 0);
 			prev = msg->flags;
-			idx = log_next(idx, true);
+			idx = log_next(idx);
 			seq++;
 		}
 
@@ -1422,7 +1099,7 @@ static int syslog_print_all(char __user *buf, int size, bool clear)
 		len = 0;
 		prev = 0;
 		while (len >= 0 && seq < next_seq) {
-			struct log *msg = log_from_idx(idx, true);
+			struct log *msg = log_from_idx(idx);
 			int textlen;
 
 			textlen = msg_print_text(msg, prev, true, text,
@@ -1431,12 +1108,12 @@ static int syslog_print_all(char __user *buf, int size, bool clear)
 				len = textlen;
 				break;
 			}
-			idx = log_next(idx, true);
+			idx = log_next(idx);
 			seq++;
 			prev = msg->flags;
 
 			raw_spin_unlock_irq(&logbuf_lock);
-			if (copy_to_user(buf + len + oops_len, text, textlen))
+			if (copy_to_user(buf + len, text, textlen))
 				len = -EFAULT;
 			else
 				len += textlen;
@@ -1458,8 +1135,6 @@ static int syslog_print_all(char __user *buf, int size, bool clear)
 	raw_spin_unlock_irq(&logbuf_lock);
 
 	kfree(text);
-	if (len > 0)
-		len += oops_len;
 	return len;
 }
 
@@ -1570,11 +1245,10 @@ int do_syslog(int type, char __user *buf, int len, bool from_file)
 
 			error = 0;
 			while (seq < log_next_seq) {
-				struct log *msg = log_from_idx(idx,
-								      true);
+				struct log *msg = log_from_idx(idx);
 
 				error += msg_print_text(msg, prev, true, NULL, 0);
-				idx = log_next(idx, true);
+				idx = log_next(idx);
 				seq++;
 				prev = msg->flags;
 			}
@@ -1585,9 +1259,6 @@ int do_syslog(int type, char __user *buf, int len, bool from_file)
 	/* Size of the log buffer */
 	case SYSLOG_ACTION_SIZE_BUFFER:
 		error = log_buf_len;
-#if defined(CONFIG_OOPS_LOG_BUFFER)
-		error += log_oops_buf_len;
-#endif
 		break;
 	default:
 		error = -EINVAL;
@@ -1919,19 +1590,11 @@ asmlinkage int vprintk_emit(int facility, int level,
 		}
 	}
 
-#ifdef CONFIG_EARLY_PRINTK_DIRECT
-	printascii(text);
-#endif
-
 	if (level == -1)
 		level = default_message_loglevel;
 
 	if (dict)
 		lflags |= LOG_PREFIX|LOG_NEWLINE;
-
-	if (is_logging_to_asus_buffer) {
-		write_to_asus_log_buffer(text, text_len, lflags);
-	}
 
 	if (!(lflags & LOG_NEWLINE)) {
 		/*
@@ -2006,8 +1669,6 @@ asmlinkage int printk_emit(int facility, int level,
 }
 EXPORT_SYMBOL(printk_emit);
 
-//extern int g_user_dbg_mode;
-extern unsigned int asusdebug_enable;
 /**
  * printk - print a kernel message
  * @fmt: format string
@@ -2033,12 +1694,6 @@ asmlinkage int printk(const char *fmt, ...)
 {
 	va_list args;
 	int r;
-
-	if (asusdebug_enable==0x11223344)
-		return 0;
-
-//	if (g_user_dbg_mode==0)
-//		return 0;
 
 #ifdef CONFIG_KGDB_KDB
 	if (unlikely(kdb_trap_printk)) {
@@ -2076,8 +1731,8 @@ static struct cont {
 	u8 level;
 	bool flushed:1;
 } cont;
-static struct log *log_from_idx(u32 idx, bool logbuf) { return NULL; }
-static u32 log_next(u32 idx, bool logbuf) { return 0; }
+static struct log *log_from_idx(u32 idx) { return NULL; }
+static u32 log_next(u32 idx) { return 0; }
 static void call_console_drivers(int level, const char *text, size_t len) {}
 static size_t msg_print_text(const struct log *msg, enum log_flags prev,
 			     bool syslog, char *buf, size_t size) { return 0; }
@@ -2250,8 +1905,7 @@ MODULE_PARM_DESC(console_suspend, "suspend console during suspend"
  */
 void suspend_console(void)
 {
-	ASUSEvtlog("[UTS] System Suspend");
-        if (!console_suspend_enabled)
+	if (!console_suspend_enabled)
 		return;
 	printk("Suspending console(s) (use no_console_suspend to debug)\n");
 	console_lock();
@@ -2261,39 +1915,12 @@ void suspend_console(void)
 
 void resume_console(void)
 {
-	int i;
-	//nSuspendInProgress = 0;
- 	ASUSEvtlog("[UTS] System Resume");
-
-	//[+++]Add GPIO wakeup information
-	if (pm_pwrcs_ret) {
-		if (gpio_irq_cnt>0) {
-			for (i=0;i<gpio_irq_cnt;i++)
-				ASUSEvtlog("[PM] GPIO triggered: %d", gpio_resume_irq[i]);
-			gpio_irq_cnt=0; //clear log count
-		}
-		if (gic_irq_cnt>0) {
-			for (i=0;i<gic_irq_cnt;i++)
-				ASUSEvtlog("[PM] IRQs triggered: %d", gic_resume_irq[i]);
-			gic_irq_cnt=0;  //clear log count
-		}
-		pm_pwrcs_ret=0;
-	}
-	//[---]Add GPIO wakeup information
 	if (!console_suspend_enabled)
 		return;
 	down(&console_sem);
 	console_suspended = 0;
 	console_unlock();
 }
-
-static void __cpuinit console_flush(struct work_struct *work)
-{
-	console_lock();
-	console_unlock();
-}
-
-static __cpuinitdata DECLARE_WORK(console_cpu_notify_work, console_flush);
 
 /**
  * console_cpu_notify - print deferred console messages after CPU hotplug
@@ -2305,27 +1932,17 @@ static __cpuinitdata DECLARE_WORK(console_cpu_notify_work, console_flush);
  * will be spooled but will not show up on the console.  This function is
  * called when a new CPU comes online (or fails to come up), and ensures
  * that any such output gets printed.
- *
- * Special handling must be done for cases invoked from an atomic context,
- * as we can't be taking the console semaphore here.
  */
 static int __cpuinit console_cpu_notify(struct notifier_block *self,
 	unsigned long action, void *hcpu)
 {
 	switch (action) {
+	case CPU_ONLINE:
 	case CPU_DEAD:
 	case CPU_DOWN_FAILED:
 	case CPU_UP_CANCELED:
 		console_lock();
 		console_unlock();
-		break;
-	case CPU_ONLINE:
-	case CPU_DYING:
-		/* invoked with preemption disabled, so defer */
-		if (!console_trylock())
-			schedule_work(&console_cpu_notify_work);
-		else
-			console_unlock();
 	}
 	return NOTIFY_OK;
 }
@@ -2472,13 +2089,13 @@ skip:
 		if (console_seq == log_next_seq)
 			break;
 
-		msg = log_from_idx(console_idx, true);
+		msg = log_from_idx(console_idx);
 		if (msg->flags & LOG_NOCONS) {
 			/*
 			 * Skip record we have buffered and already printed
 			 * directly to the console when we received it.
 			 */
-			console_idx = log_next(console_idx, true);
+			console_idx = log_next(console_idx);
 			console_seq++;
 			/*
 			 * We will get here again when we register a new
@@ -2493,7 +2110,7 @@ skip:
 		level = msg->level;
 		len = msg_print_text(msg, console_prev, false,
 				     text, sizeof(text));
-		console_idx = log_next(console_idx, true);
+		console_idx = log_next(console_idx);
 		console_seq++;
 		console_prev = msg->flags;
 		raw_spin_unlock(&logbuf_lock);
@@ -3113,10 +2730,10 @@ bool kmsg_dump_get_line_nolock(struct kmsg_dumper *dumper, bool syslog,
 	if (dumper->cur_seq >= log_next_seq)
 		goto out;
 
-	msg = log_from_idx(dumper->cur_idx, true);
+	msg = log_from_idx(dumper->cur_idx);
 	l = msg_print_text(msg, 0, syslog, line, size);
 
-	dumper->cur_idx = log_next(dumper->cur_idx, true);
+	dumper->cur_idx = log_next(dumper->cur_idx);
 	dumper->cur_seq++;
 	ret = true;
 out:
@@ -3208,10 +2825,10 @@ bool kmsg_dump_get_buffer(struct kmsg_dumper *dumper, bool syslog,
 	idx = dumper->cur_idx;
 	prev = 0;
 	while (seq < dumper->next_seq) {
-		struct log *msg = log_from_idx(idx, true);
+		struct log *msg = log_from_idx(idx);
 
 		l += msg_print_text(msg, prev, true, NULL, 0);
-		idx = log_next(idx, true);
+		idx = log_next(idx);
 		seq++;
 		prev = msg->flags;
 	}
@@ -3221,10 +2838,10 @@ bool kmsg_dump_get_buffer(struct kmsg_dumper *dumper, bool syslog,
 	idx = dumper->cur_idx;
 	prev = 0;
 	while (l > size && seq < dumper->next_seq) {
-		struct log *msg = log_from_idx(idx, true);
+		struct log *msg = log_from_idx(idx);
 
 		l -= msg_print_text(msg, prev, true, NULL, 0);
-		idx = log_next(idx, true);
+		idx = log_next(idx);
 		seq++;
 		prev = msg->flags;
 	}
@@ -3236,10 +2853,10 @@ bool kmsg_dump_get_buffer(struct kmsg_dumper *dumper, bool syslog,
 	l = 0;
 	prev = 0;
 	while (seq < dumper->next_seq) {
-		struct log *msg = log_from_idx(idx, true);
+		struct log *msg = log_from_idx(idx);
 
 		l += msg_print_text(msg, prev, syslog, buf + l, size - l);
-		idx = log_next(idx, true);
+		idx = log_next(idx);
 		seq++;
 		prev = msg->flags;
 	}
@@ -3352,73 +2969,3 @@ void show_regs_print_info(const char *log_lvl)
 }
 
 #endif
-
-void printk_buffer_rebase(void)
-{
-	printk("[Red_debug]%s is not ready\n",__func__);
-/*
- * This will NOT do real printk buffer rebase.
- * We just set a flag to let vprintk_emit() also write
- * kernel log to our remapped buffer.
- * Then we can save the content of our remapped buffer while rebooting
- * after the device crash.
- */
-//#if 0
-	asus_log_buf = (char *) PRINTK_BUFFER_VA;
-	if (!asus_log_buf) {
-		printk("%s: asus_log_buf is NULL\n", __func__);
-		return;
-	}
-	memset_nc(asus_log_buf, 0, PRINTK_BUFFER_SLOT_SIZE);
-	is_logging_to_asus_buffer = true;
-//#endif
-/*
- * Following code does not work.
- * We have to fix it.
- */
-#if 0
-	char *new_log_buf;
-	unsigned long flags;
-
-	new_log_buf = g_printk_log_buf = (char *) PRINTK_BUFFER_VA;
-	printk("printk_buffer_rebase new_log_buf=%p\n", new_log_buf);
-	if (!new_log_buf) {
-		printk( "%s: allocation failed\n", __func__);
-		goto out;
-	}
-
-	if (log_buf_len > PRINTK_BUFFER_SLOT_SIZE) {
-		/* Becasue we memcpy original log_buf to new_log_buf,
-		 * we assume that original log_buf length is less than
-		 * the new log_buf length to prevent from overwritting.
-		 */
-		printk("%s: BUG:old log_buf_len=%d > new log_buf_len=%d\n",
-				__func__, log_buf_len, PRINTK_BUFFER_SLOT_SIZE);
-		return;
-	}
-
-	printk("printk_buffer_rebase original log_buf=%p, log_buf_len=%d\n",
-			log_buf, log_buf_len);
-	//~ memset(g_printk_log_buf, 0, PRINTK_BUFFER_SLOT_SIZE);
-
-	raw_spin_lock_irqsave(&logbuf_lock, flags);
-
-	//~ memcpy(new_log_buf, log_buf, log_buf_len);
-	log_buf_len = PRINTK_BUFFER_SLOT_SIZE;
-	log_buf = new_log_buf;
-
-	asus_global.kernel_log_addr = log_buf;
-	asus_global.kernel_log_size = log_buf_len;
-	memset(asus_global.kernel_version,0,sizeof(asus_global.kernel_version));
-	strncpy(asus_global.kernel_version,ASUS_SW_VER,sizeof(asus_global.kernel_version));
-
-	raw_spin_unlock_irqrestore(&logbuf_lock, flags);
-
-	printk("%s: log_buf_len=%d\n", __func__, log_buf_len);
-
-out:
-	return;
-#endif
-}
-EXPORT_SYMBOL(printk_buffer_rebase);
-

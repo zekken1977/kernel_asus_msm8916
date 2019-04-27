@@ -199,5 +199,7 @@ extern unsigned long profile_pc(struct pt_regs *regs);
  */
 #define is_wide_instruction(instr)	((unsigned)(instr) >= 0xe800)
 
+extern int aarch32_break_trap(struct pt_regs *regs);
+
 #endif /* __ASSEMBLY__ */
 #endif

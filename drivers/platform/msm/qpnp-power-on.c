@@ -613,8 +613,8 @@ void wait_for_power_key_6s_work(struct work_struct *work)
 	static int power_key_6s_running = 0;
 	int i, duration;
 	unsigned long timeout, startime;
-	printk_buffer_slot2_addr = (ulong *)PRINTK_BUFFER_SLOT2;
-	*printk_buffer_slot2_addr = (ulong)PRINTK_BUFFER_MAGIC;
+	//printk_buffer_slot2_addr = (ulong *)PRINTK_BUFFER_SLOT2;
+	//*printk_buffer_slot2_addr = (ulong)PRINTK_BUFFER_MAGIC;
 	printk(KERN_EMERG "%s \n",__func__);
 
 	if (!power_key_6s_running) {

@@ -64,10 +64,23 @@ void ptrace_disable(struct task_struct *child)
 	user_disable_single_step(child);
 }
 
-#ifdef CONFIG_HAVE_HW_BREAKPOINT
 /*
  * Handle hitting a HW-breakpoint.
  */
+static int ptrace_break(struct pt_regs *regs)
+{
+	siginfo_t info = {
+		.si_signo = SIGTRAP,
+		.si_errno = 0,
+		.si_code  = TRAP_BRKPT,
+		.si_addr  = (void __user *)instruction_pointer(regs),
+	};
+
+	force_sig_info(SIGTRAP, &info, current);
+	return 0;
+}
+#ifdef CONFIG_HAVE_HW_BREAKPOINT
+
 static void ptrace_hbptriggered(struct perf_event *bp,
 				struct perf_sample_data *data,
 				struct pt_regs *regs)
@@ -852,6 +865,33 @@ static const struct user_regset_view user_aarch32_view = {
 	.name = "aarch32", .e_machine = EM_ARM,
 	.regsets = aarch32_regsets, .n = ARRAY_SIZE(aarch32_regsets)
 };
+
+int aarch32_break_trap(struct pt_regs *regs)
+{
+	unsigned int instr;
+	bool bp = false;
+	void __user *pc = (void __user *)instruction_pointer(regs);
+
+	if (compat_thumb_mode(regs)) {
+		/* get 16-bit Thumb instruction */
+		get_user(instr, (u16 __user *)pc);
+		if (instr == AARCH32_BREAK_THUMB2_LO) {
+			/* get second half of 32-bit Thumb-2 instruction */
+			get_user(instr, (u16 __user *)(pc + 2));
+			bp = instr == AARCH32_BREAK_THUMB2_HI;
+		} else {
+			bp = instr == AARCH32_BREAK_THUMB;
+		}
+	} else {
+		/* 32-bit ARM instruction */
+		get_user(instr, (u32 __user *)pc);
+		bp = (instr & ~0xf0000000) == AARCH32_BREAK_ARM;
+	}
+
+	if (bp)
+		return ptrace_break(regs);
+	return 1;
+}
 
 static int compat_ptrace_read_user(struct task_struct *tsk, compat_ulong_t off,
 				   compat_ulong_t __user *ret)

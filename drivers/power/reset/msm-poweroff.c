@@ -222,7 +222,7 @@ static void halt_spmi_pmic_arbiter(void)
 static void msm_restart_prepare(const char *cmd)
 {
 #ifdef CONFIG_MSM_DLOAD_MODE
-	ulong *printk_buffer_slot2_addr;
+	//ulong *printk_buffer_slot2_addr;
 #endif
 	bool is_asdf = false;
 	bool need_warm_reset = false;
@@ -274,8 +274,8 @@ static void msm_restart_prepare(const char *cmd)
 #ifdef CONFIG_MSM_DLOAD_MODE
 	if (!(in_panic || is_asdf)) {
 		// Normal reboot. Clean the printk buffer magic
-		printk_buffer_slot2_addr = (ulong *)PRINTK_BUFFER_SLOT2;
-		*printk_buffer_slot2_addr = 0;
+		//printk_buffer_slot2_addr = (ulong *)PRINTK_BUFFER_SLOT2;
+		//*printk_buffer_slot2_addr = 0;
 	}
 #endif
 
@@ -397,7 +397,7 @@ void do_msm_poweroff(void)
 {
 	int ret;
 #ifdef CONFIG_MSM_DLOAD_MODE
-	ulong *printk_buffer_slot2_addr;
+	//ulong *printk_buffer_slot2_addr;
 #endif
 	struct scm_desc desc = {
 		.args[0] = 1,
@@ -409,11 +409,11 @@ void do_msm_poweroff(void)
 
 #ifdef CONFIG_MSM_DLOAD_MODE
 	// Normal power off. Clean the printk buffer magic
-	printk_buffer_slot2_addr = (ulong *)PRINTK_BUFFER_SLOT2;
-	*printk_buffer_slot2_addr = 0;
+	//printk_buffer_slot2_addr = (ulong *)PRINTK_BUFFER_SLOT2;
+	//*printk_buffer_slot2_addr = 0;
 
 	printk(KERN_CRIT "Clean asus_global...\n");
-	memset(&asus_global,0,sizeof(asus_global));
+	//memset(&asus_global,0,sizeof(asus_global));
 	printk(KERN_CRIT "&asus_global = %p\n", &asus_global);
 	printk(KERN_CRIT "asus_global.asus_global_magic = 0x%x\n",asus_global.asus_global_magic);
 	printk(KERN_CRIT "asus_global.ramdump_enable_magic = 0x%x\n",asus_global.ramdump_enable_magic);
