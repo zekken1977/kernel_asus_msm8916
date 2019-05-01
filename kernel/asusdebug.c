@@ -966,7 +966,7 @@ static void do_write_event_worker(struct work_struct *work)
 
 extern struct timezone sys_tz;
 
-void fxxk_ASUSEvtlog(const char *fmt, ...)
+void ASUSEvtlog(const char *fmt, ...)
 {
 
 	va_list args;

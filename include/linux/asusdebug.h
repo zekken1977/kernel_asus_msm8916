@@ -200,8 +200,7 @@ void save_phone_hang_log(void);
 void save_last_shutdown_log(char *filename);
 void printk_lcd(const char *fmt, ...);
 void printk_lcd_xy(int xx, int yy, unsigned int color, const char *fmt, ...);
-//void ASUSEvtlog(const char *fmt, ...);
-#define ASUSEvtlog(fmt, ...)
+void ASUSEvtlog(const char *fmt, ...);
 //20101202_Bruno: added to get debug mask value
 bool isASUS_MSK_set(const char *fmt);
 #endif
